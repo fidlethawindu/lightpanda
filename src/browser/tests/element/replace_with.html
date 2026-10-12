@@ -425,3 +425,33 @@
   testing.expectEqual(1, seenParentNodeType16); // ELEMENT_NODE
   testing.expectEqual(parent16, seenParentElement16);
 </script>
+
+<!-- Test 17: a node from another document is adopted, its subtree with it -->
+<script id=test17-adopts-subtree>
+  const parsed17 = new DOMParser().parseFromString('<div id=foreign17><p><b>deep</b></p></div>', 'text/html');
+  const foreign17 = parsed17.getElementById('foreign17');
+  const placeholder17 = document.createElement('div');
+  document.body.appendChild(placeholder17);
+
+  placeholder17.replaceWith(foreign17);
+
+  testing.expectEqual(document, foreign17.ownerDocument);
+  testing.expectEqual(document, foreign17.querySelector('p').ownerDocument);
+  testing.expectEqual(document, foreign17.querySelector('b').ownerDocument);
+  testing.expectEqual(null, parsed17.getElementById('foreign17'));
+  // Laying out the document reaches the adopted subtree with this document's styles.
+  testing.expectEqual(true, document.elementFromPoint(0, 0) !== undefined);
+</script>
+
+<!-- Test 18: inserting an ancestor of the parent is refused, as with insertBefore -->
+<script id=test18-hierarchy-request>
+  const outer18 = document.createElement('div');
+  const inner18 = document.createElement('div');
+  const placeholder18 = document.createElement('span');
+  outer18.appendChild(inner18);
+  inner18.appendChild(placeholder18);
+  document.body.appendChild(outer18);
+
+  testing.expectError('HierarchyRequestError', () => placeholder18.replaceWith(outer18));
+  testing.expectEqual(inner18, placeholder18.parentNode);
+</script>

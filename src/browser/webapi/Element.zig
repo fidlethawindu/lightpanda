@@ -1167,7 +1167,6 @@ pub fn replaceChildren(self: *Element, nodes: []const Node.NodeOrText, frame: *F
 pub fn replaceWith(self: *Element, nodes: []const Node.NodeOrText, frame: *Frame) !void {
     const ref_node = self.asNode();
     const parent = ref_node._parent orelse return;
-    frame.domChanged();
 
     // Detect if the ref_node must be removed (by default) or kept.
     // We kept it when ref_node is present into the nodes list.
@@ -1182,29 +1181,15 @@ pub fn replaceWith(self: *Element, nodes: []const Node.NodeOrText, frame: *Frame
             continue;
         }
 
-        // A DocumentFragment contributes its children, not itself
-        if (child.is(Node.DocumentFragment)) |_| {
-            try frame.insertAllChildrenBefore(child, parent, ref_node);
-            continue;
-        }
-
-        var previous_root: ?*Node = null;
-        if (child._parent) |current_parent| {
-            previous_root = child.getRootNode(.{});
-            frame.removeNode(current_parent, child, .{ .reconnect_to = parent });
-        }
-
-        try frame.insertNodeRelative(
-            parent,
-            child,
-            .{ .before = ref_node },
-            .{ .previous_root = previous_root },
-        );
+        // insertBefore adopts a node from another document, its subtree with
+        // it, and inserts a DocumentFragment's children.
+        _ = try parent.insertBefore(child, ref_node, frame);
     }
 
-    // Re-check parent after insertNodeRelative since callbacks (e.g. connectedCallback)
+    // Re-check parent after the insertions since callbacks (e.g. connectedCallback)
     // could have already removed ref_node from parent.
     if (rm_ref_node and ref_node._parent == parent) {
+        frame.domChanged();
         frame.removeNode(parent, ref_node, .{ .reconnect_to = null });
     }
 }
