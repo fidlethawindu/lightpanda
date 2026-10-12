@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<script src="../testing.js"></script>
+<body style="height:4000px;width:4000px">
+  <div id=window_target style="height:20px;width:30px"></div>
+  <div id=outer style="height:60px;width:200px;overflow:auto">
+    <div id=outer_lead style="height:20px;width:200px"></div>
+    <div id=inner style="height:40px;width:200px;overflow:auto">
+      <div id=inner_lead style="height:20px;width:200px"></div>
+      <div id=inner_target style="height:20px;width:200px"></div>
+      <div id=inner_tail style="height:500px;width:200px"></div>
+    </div>
+    <div id=outer_tail style="height:500px;width:200px"></div>
+  </div>
+</body>
+
+<script id=window-scroll-moves-rects>
+  {
+    const target = document.getElementById('window_target');
+    const before = target.getBoundingClientRect();
+    window.scrollTo(7, 300);
+    const after = target.getBoundingClientRect();
+    testing.expectEqual(before.top - 300, after.top);
+    testing.expectEqual(before.left - 7, after.left);
+    testing.expectEqual(before.height, after.height);
+    window.scrollTo(0, 0);
+    testing.expectEqual(before.top, target.getBoundingClientRect().top);
+  }
+</script>
+
+<script id=container-scroll-moves-its-content-not-itself>
+  {
+    const outer = document.getElementById('outer');
+    const lead = document.getElementById('outer_lead');
+    const outerBefore = outer.getBoundingClientRect();
+    const leadBefore = lead.getBoundingClientRect();
+    outer.scrollTop = 15;
+    testing.expectEqual(15, outer.scrollTop);
+    testing.expectEqual(outerBefore.top, outer.getBoundingClientRect().top);
+    testing.expectEqual(leadBefore.top - 15, lead.getBoundingClientRect().top);
+    outer.scrollTop = 0;
+  }
+</script>
+
+<script id=nested-containers-add-up>
+  {
+    const outer = document.getElementById('outer');
+    const inner = document.getElementById('inner');
+    const target = document.getElementById('inner_target');
+    const innerBefore = inner.getBoundingClientRect();
+    const targetBefore = target.getBoundingClientRect();
+    window.scrollTo(0, 100);
+    outer.scrollTop = 10;
+    inner.scrollTop = 4;
+    testing.expectEqual(innerBefore.top - 100 - 10, inner.getBoundingClientRect().top);
+    testing.expectEqual(targetBefore.top - 100 - 10 - 4, target.getBoundingClientRect().top);
+    inner.scrollTop = 0;
+    outer.scrollTop = 0;
+    window.scrollTo(0, 0);
+  }
+</script>
+
+<script id=element-from-point-takes-viewport-coordinates>
+  {
+    const outer = document.getElementById('outer');
+    const inner = document.getElementById('inner');
+    const windowTarget = document.getElementById('window_target');
+    const innerTarget = document.getElementById('inner_target');
+
+    window.scrollTo(0, 100);
+    const windowRect = windowTarget.getBoundingClientRect();
+    testing.expectEqual(windowTarget, document.elementFromPoint(windowRect.left + 1, windowRect.top + 1));
+
+    outer.scrollTop = 10;
+    inner.scrollTop = 4;
+    const rect = innerTarget.getBoundingClientRect();
+    testing.expectEqual(innerTarget, document.elementFromPoint(rect.left + 1, rect.top + 1));
+    // Its document position, where nothing has scrolled it, is no longer the target.
+    const documentTop = rect.top + 100 + 10 + 4;
+    testing.expectEqual(true, document.elementFromPoint(rect.left + 1, documentTop + 1) !== innerTarget);
+
+    inner.scrollTop = 0;
+    outer.scrollTop = 0;
+    window.scrollTo(0, 0);
+  }
+</script>

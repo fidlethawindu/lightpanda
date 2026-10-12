@@ -1677,13 +1677,38 @@ pub fn boundingClientRectValues(self: *Element, frame: *Frame) DOMRect.Data {
 }
 
 // Some cases need the bounding rect but have already done the visibility check.
+// The rect is relative to the viewport: the faux-layout document position less
+// the scroll offset of everything that scrolls the element.
 pub fn boundingClientRectValuesForVisible(self: *Element, frame: *Frame) DOMRect.Data {
+    const offset = self.scrollOffset(frame);
     return .{
-        .x = self.horizontalPosition(frame),
-        .y = calculateDocumentPosition(self.asNode()),
+        .x = self.horizontalPosition(frame) - offset.x,
+        .y = calculateDocumentPosition(self.asNode()) - offset.y,
         .width = self.boxAxis(frame, .width),
         .height = self.boxAxis(frame, .height),
     };
+}
+
+pub const ScrollOffset = struct { x: f64 = 0, y: f64 = 0 };
+
+/// How far scrolling has moved the element: its frame's viewport scroll plus
+/// the scroll position of every ancestor container scrolled on its own. An
+/// element's own scroll position moves its content, not itself. html and body
+/// scroll the viewport, so they never count as containers here.
+pub fn scrollOffset(self: *Element, frame: *Frame) ScrollOffset {
+    const owner = self.ownerFrame(frame) orelse return .{};
+    var offset: ScrollOffset = .{
+        .x = @floatFromInt(owner.window.getScrollX()),
+        .y = @floatFromInt(owner.window.getScrollY()),
+    };
+    var current = self.parentElement();
+    while (current) |el| : (current = el.parentElement()) {
+        if (el.isRootContainer()) continue;
+        const pos = owner.page.element_scroll_positions.get(el) orelse continue;
+        offset.x += @floatFromInt(pos.x);
+        offset.y += @floatFromInt(pos.y);
+    }
+    return offset;
 }
 
 pub fn getClientRects(self: *Element, frame: *Frame) ![]*DOMRect {

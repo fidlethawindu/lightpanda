@@ -985,23 +985,36 @@ pub fn elementFromVerticalPoint(self: *Document, y: f64, frame: *Frame) !?*Eleme
 }
 
 fn elementFromPointImpl(self: *Document, x: f64, y: f64, ignore_x: bool, frame: *Frame) !?*Element {
-    // DFS in document order; topmost = last visited element whose rect contains (x, y).
+    // (x, y) is relative to the viewport. DFS in document order; topmost =
+    // last visited element whose rect contains the point. Rects are the
+    // faux-layout document position less the scroll offset (see
+    // Element.scrollOffset): the viewport's, plus that of every scrolled
+    // ancestor container, which each entry carries down to its children.
     //
     // Faux-layout shortcut: rect.top is calculateDocumentPosition × 5, which is
     // monotonically increasing in document order. So we maintain a running
     // preorder counter instead of calling calculateDocumentPosition per node
-    // (which itself is O(N)). Once the counter's y passes the query y, no
-    // later element can contain the point, and we can return.
+    // (which itself is O(N)). While no container is scrolled, the viewport's
+    // offset is the same for every element, so tops stay in document order:
+    // once one passes the query y, no later element can contain the point, and
+    // we can return. A scrolled container moves its subtree up, out of that
+    // order, so with one anywhere on the page every element is visited.
     //
     // Hidden subtrees still count towards the index so positions agree with
     // getBoundingClientRect; the hidden verdict just rides down the stack.
     var topmost: ?*Element = null;
 
     const root = self.asNode();
-    const style_manager = &(root.ownerFrame(frame) orelse return null)._style_manager;
-    const Entry = struct { node: *Node, hidden: bool };
+    const owner = root.ownerFrame(frame) orelse return null;
+    const style_manager = &owner._style_manager;
+    const viewport_x: f64 = @floatFromInt(owner.window.getScrollX());
+    const viewport_y: f64 = @floatFromInt(owner.window.getScrollY());
+    const scrolled_positions = &owner.page.element_scroll_positions;
+    const in_document_order = scrolled_positions.count() == 0;
+
+    const Entry = struct { node: *Node, hidden: bool, offset_x: f64, offset_y: f64 };
     var stack: std.ArrayList(Entry) = .empty;
-    try stack.append(frame.local_arena, .{ .node = root, .hidden = false });
+    try stack.append(frame.local_arena, .{ .node = root, .hidden = false, .offset_x = viewport_x, .offset_y = viewport_y });
 
     var preorder_index: f64 = 0;
 
@@ -1009,30 +1022,38 @@ fn elementFromPointImpl(self: *Document, x: f64, y: f64, ignore_x: bool, frame: 
         const entry = stack.pop() orelse break;
         const node = entry.node;
         var hidden = entry.hidden;
-        const pos = preorder_index * 5.0;
+        const top = preorder_index * 5.0 - entry.offset_y;
 
-        if (pos > y) {
+        if (in_document_order and top > y) {
             // Monotonic: no later element has top <= y, so none can contain (x, y).
             return topmost;
         }
 
         preorder_index += 1;
+        var children_offset_x = entry.offset_x;
+        var children_offset_y = entry.offset_y;
         if (node.is(Element)) |element| {
             hidden = hidden or style_manager.hasDisplayNone(element);
             // Unlike display:none, a child can opt back in, so the subtree is
             // still walked.
             if (!hidden and style_manager.isHitTestable(element)) {
-                if (y >= pos and y <= pos + element.boxAxis(frame, .height)) {
+                if (y >= top and y <= top + element.boxAxis(frame, .height)) {
                     if (ignore_x) {
                         topmost = element;
                     } else {
                         // only bother calculating the horiziontal position for
                         // elements contained by the vertical band
-                        const left = element.horizontalPosition(frame);
+                        const left = element.horizontalPosition(frame) - entry.offset_x;
                         if (x >= left and x <= left + element.boxAxis(frame, .width)) {
                             topmost = element;
                         }
                     }
+                }
+            }
+            if (!element.isRootContainer()) {
+                if (scrolled_positions.get(element)) |pos| {
+                    children_offset_x += @floatFromInt(pos.x);
+                    children_offset_y += @floatFromInt(pos.y);
                 }
             }
         }
@@ -1040,7 +1061,7 @@ fn elementFromPointImpl(self: *Document, x: f64, y: f64, ignore_x: bool, frame: 
         // Add children to stack in reverse order so we process them in document order
         var child = node.lastChild();
         while (child) |c| {
-            try stack.append(frame.local_arena, .{ .node = c, .hidden = hidden });
+            try stack.append(frame.local_arena, .{ .node = c, .hidden = hidden, .offset_x = children_offset_x, .offset_y = children_offset_y });
             child = c.previousSibling();
         }
     }
