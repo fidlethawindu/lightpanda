@@ -201,6 +201,12 @@ pub fn detach(self: *const Driver) void {
 
 // One iteration of the worker loop. Returns false to disconnect.
 fn tick(self: *const Driver) !bool {
+    // The watchdog stopped a stalled script; nothing is on the stack here, so
+    // the page and this connection carry on.
+    if (self.browser.env.terminatePending() and self.browser.env.recoverFromStall()) {
+        log.warn(self.scope, "page kept after watchdog stall", .{});
+    }
+
     if (self.browser.env.terminatePending()) {
         // Our own requestTerminate from Server.dropWebSocket: the peer is gone or
         // sent garbage. Report it with its own close code, nothing to warn
@@ -266,4 +272,22 @@ fn pageWait(self: *const Driver) ?PageWait {
             return .{ .session = bidi.user_context.session, .frame_id = context.frame_id };
         },
     }
+}
+
+const testing = @import("cdp/testing.zig");
+test "Driver: a watchdog stall keeps the connection, a fatal termination closes it" {
+    testing.expectLog(&.{.cdp});
+
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    const env = &ctx.cdp().browser.env;
+
+    env.requestTerminateForStall(31_000);
+    try testing.expect(try ctx.driver.tick());
+    try testing.expectEqual(false, env.terminatePending());
+
+    env.requestTerminate();
+    // Clear it so deinit's V8 calls don't trip over the terminating-state asserts.
+    defer env.cancelTerminate();
+    try testing.expectEqual(false, try ctx.driver.tick());
 }

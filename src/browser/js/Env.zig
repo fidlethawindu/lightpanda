@@ -111,6 +111,11 @@ terminate_mutex: std.Io.Mutex = .init,
 // thread making sure terminate hasn't been canceled.
 terminate_requested: std.atomic.Value(bool) = .init(false),
 
+// Set with terminate_requested by every termination that means this browser must
+// stop (shutdown, a peer that's gone, the heap limit), but not by the watchdog's:
+// a stalled script is stopped and its page kept (see recoverFromStall).
+fatal_terminate_requested: std.atomic.Value(bool) = .init(false),
+
 // Boot-clock ms at which the watchdog asked for a stall report; 0 = none.
 // Set by the watchdog thread, consumed on the worker by terminateInterrupt so
 // the stalled script can be identified before it is killed.
@@ -650,6 +655,7 @@ pub fn terminatePending(self: *const Env) bool {
 pub fn terminate(self: *Env) void {
     self.terminate_mutex.lockUncancelable(lp.io);
     defer self.terminate_mutex.unlock(lp.io);
+    self.fatal_terminate_requested.store(true, .release);
     self.terminate_requested.store(true, .release);
     v8.v8__Isolate__TerminateExecution(self.isolate.handle);
 }
@@ -707,16 +713,51 @@ fn onNearHeapLimit(self: *Env, current_limit: usize, initial_limit: usize) usize
 
 // Called from the network thread, caused v8 to eventually call terminateInterrupt
 pub fn requestTerminate(self: *Env) void {
+    self.fatal_terminate_requested.store(true, .release);
+    self.requestTerminateExecution();
+}
+
+fn requestTerminateExecution(self: *Env) void {
     self.terminate_requested.store(true, .release);
     v8.v8__Isolate__RequestInterrupt(self.isolate.handle, terminateInterrupt, self);
 }
 
-// Called from the watchdog thread. Like requestTerminate, but the worker also
-// logs the running script's frame URL and stack before termination.
+// Called from the watchdog thread. Stops the running script like
+// requestTerminate, and the worker also logs its frame URL and stack before
+// termination. It isn't fatal: once the script is off the stack, the worker
+// recovers (recoverFromStall) and the page lives on.
 pub fn requestTerminateForStall(self: *Env, stalled_ms: u64) void {
     self.stall_report_stalled_ms.store(stalled_ms, .monotonic);
     self.stall_report_requested_at.store(@max(lp.datetime.milliTimestamp(.boot), 1), .release);
-    self.requestTerminate();
+    self.requestTerminateExecution();
+}
+
+// Worker thread, with no script on the stack (between iterations of its loop).
+// A termination only the watchdog asked for has done its job by then: the
+// stalled script was stopped, or had already returned to native code. Cancel
+// it, so the page and its connection carry on. A fatal termination is left in
+// place. Returns whether a stall termination was cancelled.
+pub fn recoverFromStall(self: *Env) bool {
+    self.terminate_mutex.lockUncancelable(lp.io);
+    defer self.terminate_mutex.unlock(lp.io);
+    if (self.terminate_requested.load(.acquire) == false) {
+        return false;
+    }
+    if (self.fatal_terminate_requested.load(.acquire)) {
+        return false;
+    }
+    for (self.contexts.items) |ctx| {
+        if (ctx.call_depth > 0) {
+            return false;
+        }
+    }
+    // A stall report still pending was requested while the worker sat in
+    // native code; no script is left to identify. terminateInterrupt, if it
+    // still runs, sees terminate_requested cleared and stops nothing.
+    self.stall_report_requested_at.store(0, .release);
+    self.terminate_requested.store(false, .release);
+    v8.v8__Isolate__CancelTerminateExecution(self.isolate.handle);
+    return true;
 }
 
 // Boot-clock ms at which a stall report was requested but not yet logged by
@@ -818,6 +859,7 @@ pub fn cancelTerminate(self: *Env) void {
     self.terminate_mutex.lockUncancelable(lp.io);
     defer self.terminate_mutex.unlock(lp.io);
     self.terminate_requested.store(false, .release);
+    self.fatal_terminate_requested.store(false, .release);
     self.stall_report_requested_at.store(0, .release);
     self.heap_report_requested.store(false, .release);
     v8.v8__Isolate__CancelTerminateExecution(self.isolate.handle);
@@ -1138,6 +1180,36 @@ test "Env: canceling a termination drops its pending stall report" {
     var ls: js.Local.Scope = undefined;
     frame.js.localScope(&ls);
     defer ls.deinit();
+    try testing.expectEqual(3, try (try ls.local.exec("1 + 2", null)).toI32());
+}
+
+test "Env: a watchdog stall termination is recovered, a fatal one is not" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    const env = frame.js.env;
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    env.requestTerminateForStall(31_000);
+    try testing.expect(env.recoverFromStall());
+    try testing.expectEqual(false, env.terminatePending());
+    // The interrupt the watchdog queued still runs on the next script, and must
+    // stop nothing now.
+    try testing.expectEqual(3, try (try ls.local.exec("1 + 2", null)).toI32());
+
+    env.requestTerminate();
+    try testing.expectEqual(false, env.recoverFromStall());
+    try testing.expect(env.terminatePending());
+    env.cancelTerminate();
+
+    // A stall on top of a fatal termination stays fatal.
+    env.requestTerminate();
+    env.requestTerminateForStall(31_000);
+    try testing.expectEqual(false, env.recoverFromStall());
+    try testing.expect(env.terminatePending());
+    env.cancelTerminate();
     try testing.expectEqual(3, try (try ls.local.exec("1 + 2", null)).toI32());
 }
 
