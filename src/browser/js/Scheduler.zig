@@ -51,12 +51,28 @@ generation: u64,
 // considered done.
 blocking: u32,
 
+// Idle callbacks (requestIdleCallback), in the order they were requested.
+// https://w3c.github.io/requestidlecallback/
+idle: std.ArrayList(IdleTask),
+
+// No idle period starts before this boot-clock ms: the deadline of the last
+// one. A callback requested during an idle period waits for the next one, so a
+// callback that requests itself again runs once per period, not in a busy loop.
+next_idle_period_at: u64,
+
+// While an idle callback runs: the deadline and whether it was its timeout
+// that ran it, for the IdleDeadline it receives.
+idle_period: ?IdlePeriod,
+
 pub fn init(allocator: Allocator) Scheduler {
     return .{
         ._sequence = 0,
         .allocator = allocator,
         .generation = 0,
         .blocking = 0,
+        .idle = .empty,
+        .next_idle_period_at = 0,
+        .idle_period = null,
         .timed = Queue.initContext({}),
         .immediate = .{},
         .front = .{},
@@ -70,12 +86,15 @@ pub fn deinit(self: *Scheduler) void {
 pub fn reset(self: *Scheduler) void {
     self.finalizeTasks();
     self.blocking = 0;
+    self.idle.clearRetainingCapacity();
+    self.next_idle_period_at = 0;
+    self.idle_period = null;
     self.front.clear();
     self.immediate.clear();
     self.timed.clearRetainingCapacity();
 }
 
-const AddOpts = struct {
+pub const AddOpts = struct {
     name: []const u8 = "",
     front: bool = false, // run before any other tasks, multi-fronts are FIFO amongst themselves
     blocks_done: bool = true,
@@ -108,6 +127,49 @@ pub fn add(self: *Scheduler, ctx: *anyopaque, cb: Callback, run_in_ms: u32, opts
     } else {
         try self.timed.push(self.allocator, task);
     }
+
+    if (opts.blocks_done) {
+        self.blocking += 1;
+    }
+}
+
+// The longest an idle period lasts, per the spec's recommendation: long enough
+// for useful work, short enough to stay responsive to new input.
+const IDLE_PERIOD_MAX_MS = 50;
+
+pub const IdlePeriod = struct {
+    // boot-clock ms by which the callback should yield
+    deadline: u64,
+    did_timeout: bool,
+};
+
+const IdleTask = struct {
+    task: Task,
+    // boot-clock ms past which the callback runs whether or not the page is
+    // idle (requestIdleCallback's timeout option)
+    timeout_at: ?u64,
+};
+
+// Queues `cb` to run in the next idle period: once no task is ready to run.
+// With `timeout_ms`, it runs at that point at the latest, idle or not.
+pub fn addIdle(self: *Scheduler, ctx: *anyopaque, cb: Callback, timeout_ms: ?u32, opts: AddOpts) !void {
+    if (comptime lp.IS_DEBUG) {
+        log.debug(.scheduler, "scheduler.addIdle", .{ .name = opts.name, .timeout_ms = timeout_ms, .blocks_done = opts.blocks_done });
+        std.debug.assert(opts.front == false);
+    }
+
+    const now = lp.datetime.milliTimestamp(.boot);
+    try self.idle.append(self.allocator, .{
+        .task = .{
+            .ctx = ctx,
+            .callback = cb,
+            .name = opts.name,
+            .key = self.nextKey(now),
+            .finalizer = opts.finalizer,
+            .blocks_done = opts.blocks_done,
+        },
+        .timeout_at = if (timeout_ms) |ms| now + ms else null,
+    });
 
     if (opts.blocks_done) {
         self.blocking += 1;
@@ -148,6 +210,78 @@ pub fn run(self: *Scheduler) !void {
             return;
         }
     }
+
+    try self.runIdle();
+}
+
+// Idle callbacks whose timeout has passed run first, as tasks of their own.
+// Then, when no task is ready, an idle period starts and runs the callbacks
+// requested before it, until its deadline.
+fn runIdle(self: *Scheduler) !void {
+    var now = lp.datetime.milliTimestamp(.boot);
+
+    var i: usize = 0;
+    while (i < self.idle.items.len) {
+        const timeout_at = self.idle.items[i].timeout_at orelse {
+            i += 1;
+            continue;
+        };
+        if (timeout_at > now) {
+            i += 1;
+            continue;
+        }
+        const idle_task = self.idle.orderedRemove(i);
+        self.runIdleTask(idle_task.task, .{ .deadline = now, .did_timeout = true });
+        now = lp.datetime.milliTimestamp(.boot);
+    }
+
+    if (self.idle.items.len == 0 or now < self.next_idle_period_at) {
+        return;
+    }
+    if (self.taskReady(now)) {
+        return;
+    }
+
+    var deadline = now + IDLE_PERIOD_MAX_MS;
+    if (self.timed.peek()) |next| {
+        deadline = @min(deadline, next.runAt());
+    }
+    self.next_idle_period_at = deadline;
+
+    // Callbacks requested while this period runs wait for the next one.
+    var remaining = self.idle.items.len;
+    while (remaining > 0 and now < deadline) : (remaining -= 1) {
+        const idle_task = self.idle.orderedRemove(0);
+        self.runIdleTask(idle_task.task, .{ .deadline = deadline, .did_timeout = false });
+        now = lp.datetime.milliTimestamp(.boot);
+    }
+}
+
+fn runIdleTask(self: *Scheduler, task: Task, period: IdlePeriod) void {
+    if (task.blocks_done) {
+        self.blocking -= 1;
+    }
+    self.generation +%= 1;
+    self.idle_period = period;
+    defer self.idle_period = null;
+
+    const repeat_in_ms = task.callback(task.ctx) catch |err| {
+        log.debug(.scheduler, "idle task.callback", .{ .name = task.name, .err = err });
+        return;
+    };
+    if (comptime lp.IS_DEBUG) {
+        // an idle callback asks for the next idle period itself
+        std.debug.assert(repeat_in_ms == null);
+    }
+}
+
+// Whether a task other than an idle callback is ready to run.
+fn taskReady(self: *Scheduler, now: u64) bool {
+    if (self.immediate.peek() != null or self.front.peek() != null) {
+        return true;
+    }
+    const task = self.timed.peek() orelse return false;
+    return task.runAt() <= now;
 }
 
 pub fn hasReadyTasks(self: *Scheduler) bool {
@@ -163,9 +297,22 @@ pub fn msToNext(self: *Scheduler) ?u64 {
     if (self.immediate.peek() != null or self.front.peek() != null) {
         return 0;
     }
-    const task = self.timed.peek() orelse return null;
-    const run_at = task.runAt();
     const now = lp.datetime.milliTimestamp(.boot);
+    var next: ?u64 = null;
+    if (self.timed.peek()) |task| {
+        next = task.runAt();
+    }
+    if (self.idle.items.len > 0) {
+        // the next idle period, or an earlier timeout
+        var idle_at = self.next_idle_period_at;
+        for (self.idle.items) |idle_task| {
+            if (idle_task.timeout_at) |timeout_at| {
+                idle_at = @min(idle_at, timeout_at);
+            }
+        }
+        next = if (next) |n| @min(n, idle_at) else idle_at;
+    }
+    const run_at = next orelse return null;
     return if (run_at <= now) 0 else run_at - now;
 }
 
@@ -226,6 +373,11 @@ fn finalizeTasks(self: *Scheduler) void {
     while (it.next()) |t| {
         if (t.finalizer) |func| {
             func(t.ctx);
+        }
+    }
+    for (self.idle.items) |idle_task| {
+        if (idle_task.task.finalizer) |func| {
+            func(idle_task.task.ctx);
         }
     }
 }
@@ -347,6 +499,58 @@ test "Scheduler: blocksCompletion" {
     try testing.expectEqual(false, s.blocksCompletion());
 }
 
+test "Scheduler: idle tasks run once no task is ready, and block completion" {
+    var s = Scheduler.init(testing.arena_allocator);
+    var ran: std.ArrayList(u8) = .empty;
+    var t1: TestTask = .{ .id = 1, .ran = &ran, .idle_of = &s };
+    var t2: TestTask = .{ .id = 2, .ran = &ran };
+    var t3: TestTask = .{ .id = 3, .ran = &ran };
+
+    try s.addIdle(&t1, TestTask.run, 10_000, .{});
+    try s.add(&t2, TestTask.run, 0, .{});
+    try s.add(&t3, TestTask.run, 10_000, .{ .blocks_done = false });
+    try testing.expectEqual(true, s.blocksCompletion());
+    try testing.expectEqual(0, s.msToNext().?);
+
+    try s.run();
+    // the immediate first, then the idle period, long before the timeout
+    try testing.expectEqualSlices(u8, &.{ 2, 1 }, ran.items);
+    try testing.expectEqual(false, t1.idle_period.?.did_timeout);
+    try testing.expectEqual(null, s.idle_period);
+    try testing.expectEqual(false, s.blocksCompletion());
+    try testing.expectEqual(0, s.idle.items.len);
+}
+
+test "Scheduler: an idle task past its timeout runs as timed out" {
+    var s = Scheduler.init(testing.arena_allocator);
+    var ran: std.ArrayList(u8) = .empty;
+    var t1: TestTask = .{ .id = 1, .ran = &ran, .idle_of = &s };
+    var t2: TestTask = .{ .id = 2, .ran = &ran, .repeat = 1 };
+
+    try s.addIdle(&t1, TestTask.run, 1, .{});
+    lp.io.sleep(.fromMilliseconds(5), .awake) catch {};
+    try s.add(&t2, TestTask.run, 0, .{});
+    try s.run();
+    try testing.expectEqualSlices(u8, &.{ 2, 1 }, ran.items);
+    try testing.expectEqual(true, t1.idle_period.?.did_timeout);
+    try testing.expectEqual(0, s.idle.items.len);
+}
+
+test "Scheduler: an idle task requested during an idle period waits for the next" {
+    var s = Scheduler.init(testing.arena_allocator);
+    var ran: std.ArrayList(u8) = .empty;
+    var t2: TestTask = .{ .id = 2, .ran = &ran };
+    var t1: TestTask = .{ .id = 1, .ran = &ran, .then_idle = .{ .scheduler = &s, .task = &t2 } };
+
+    try s.addIdle(&t1, TestTask.run, null, .{});
+    try s.run();
+    try testing.expectEqualSlices(u8, &.{1}, ran.items);
+    try testing.expectEqual(1, s.idle.items.len);
+    // the next idle period starts at this one's deadline
+    try testing.expect(s.msToNext().? > 0);
+    try testing.expect(s.msToNext().? <= IDLE_PERIOD_MAX_MS);
+}
+
 test "Scheduler: immediate queue reclaims consumed prefix" {
     var im: Immediate = .{};
     const dummy: Task = .{
@@ -372,9 +576,19 @@ const TestTask = struct {
     id: u8,
     ran: *std.ArrayList(u8),
     repeat: ?u32 = null,
+    // idle tasks: the scheduler, to record the idle period they ran in
+    idle_of: ?*Scheduler = null,
+    idle_period: ?IdlePeriod = null,
+    then_idle: ?struct { scheduler: *Scheduler, task: *TestTask } = null,
 
     fn run(ptr: *anyopaque) anyerror!?u32 {
         const self: *TestTask = @ptrCast(@alignCast(ptr));
+        if (self.idle_of) |scheduler| {
+            self.idle_period = scheduler.idle_period;
+        }
+        if (self.then_idle) |then| {
+            try then.scheduler.addIdle(then.task, TestTask.run, null, .{});
+        }
         try self.ran.append(testing.arena_allocator, self.id);
         defer self.repeat = null;
         return self.repeat;

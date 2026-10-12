@@ -25,6 +25,7 @@ const std = @import("std");
 const lp = @import("lightpanda");
 
 const js = @import("../js/js.zig");
+const Scheduler = @import("../js/Scheduler.zig");
 
 const log = lp.log;
 
@@ -86,6 +87,8 @@ const ScheduleOpts = struct {
     name: []const u8,
     blocks_done: bool = true,
     mode: Mode = .normal,
+    // .idle only: run by then at the latest, idle or not
+    idle_timeout_ms: ?u32 = null,
 };
 
 // setTimeout/setInterval take the delay as a WebIDL long: wrapped to 32 bits, negatives clamped to 0.
@@ -143,11 +146,15 @@ pub fn schedule(
     };
     gop.value_ptr.* = callback;
 
-    try exec.js.scheduler.add(callback, ScheduleCallback.run, delay, .{
+    const add_opts: Scheduler.AddOpts = .{
         .name = opts.name,
         .blocks_done = opts.blocks_done and nesting <= BLOCKING_NESTING,
         .finalizer = ScheduleCallback.cancelled,
-    });
+    };
+    switch (opts.mode) {
+        .idle => try exec.js.scheduler.addIdle(callback, ScheduleCallback.run, opts.idle_timeout_ms, add_opts),
+        .normal, .animation_frame => try exec.js.scheduler.add(callback, ScheduleCallback.run, delay, add_opts),
+    }
 
     if (opts.repeat) {
         self._repeating += 1;
@@ -267,7 +274,8 @@ const ScheduleCallback = struct {
         switch (self.mode) {
             .idle => {
                 const IdleDeadline = @import("IdleDeadline.zig");
-                self.invoke(&ls.local, .{IdleDeadline{}}, "idleCallback");
+                const period = self.exec.js.scheduler.idle_period orelse return error.NoIdlePeriod;
+                self.invoke(&ls.local, .{IdleDeadline.init(period)}, "idleCallback");
             },
             .animation_frame => {
                 const now = switch (self.exec.js.global) {

@@ -16,20 +16,31 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+// https://w3c.github.io/requestidlecallback/#the-idledeadline-interface
+const lp = @import("lightpanda");
+
+const Scheduler = @import("../js/Scheduler.zig");
+
 const IdleDeadline = @This();
 
-// Padding to avoid zero-size struct, which causes identity_map pointer collisions.
-_pad: bool = false,
+// boot-clock ms by which the callback should yield
+_deadline: u64,
+_did_timeout: bool,
 
-pub fn init() IdleDeadline {
-    return .{};
+pub fn init(period: Scheduler.IdlePeriod) IdleDeadline {
+    return .{ ._deadline = period.deadline, ._did_timeout = period.did_timeout };
 }
 
-fn timeRemaining(_: *const IdleDeadline) f64 {
-    // Return a fixed 50ms.
-    // This allows idle callbacks to perform work without complex
-    // timing infrastructure.
-    return 50.0;
+fn timeRemaining(self: *const IdleDeadline) f64 {
+    const now = lp.datetime.milliTimestamp(.boot);
+    if (now >= self._deadline) {
+        return 0;
+    }
+    return @floatFromInt(self._deadline - now);
+}
+
+fn getDidTimeout(self: *const IdleDeadline) bool {
+    return self._did_timeout;
 }
 
 pub const JsApi = struct {
@@ -40,9 +51,8 @@ pub const JsApi = struct {
         pub const name = "IdleDeadline";
         pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
-        pub const empty_with_no_proto = true;
     };
 
     pub const timeRemaining = bridge.function(IdleDeadline.timeRemaining, .{});
-    pub const didTimeout = bridge.property(false, .{ .template = false });
+    pub const didTimeout = bridge.accessor(IdleDeadline.getDidTimeout, null, .{});
 };

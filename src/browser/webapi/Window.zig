@@ -571,12 +571,14 @@ const RequestIdleCallbackOpts = struct {
 };
 pub fn requestIdleCallback(self: *Window, cb: js.Function.Global, opts_: ?RequestIdleCallbackOpts, exec: *js.Execution) !u32 {
     const opts = opts_ orelse RequestIdleCallbackOpts{};
-    return self._timers.schedule(exec, cb, opts.timeout orelse 50, .{
+    // A timeout of 0 (the IDL default) means none.
+    const timeout: ?u32 = if (opts.timeout) |ms| if (ms > 0) ms else null else null;
+    return self._timers.schedule(exec, cb, 0, .{
         .mode = .idle,
         .repeat = false,
         .params = &.{},
-        .blocks_done = false,
         .name = "window.requestIdleCallback",
+        .idle_timeout_ms = timeout,
     });
 }
 

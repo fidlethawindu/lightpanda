@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<script src="../testing.js"></script>
+
+<script id=runs-when-idle-before-timeout type=module>
+  {
+    const state = await testing.async();
+
+    // The timeout is an upper bound: an idle page runs the callback long before it.
+    const requested = performance.now();
+    let waited = null;
+    let didTimeout = null;
+    let remaining = null;
+    window.requestIdleCallback((deadline) => {
+      waited = performance.now() - requested;
+      didTimeout = deadline.didTimeout;
+      remaining = deadline.timeRemaining();
+      state.resolve();
+    }, { timeout: 5000 });
+
+    await state.done(() => {
+      testing.expectEqual(true, waited < 1000);
+      testing.expectEqual(false, didTimeout);
+      testing.expectEqual(true, remaining >= 0 && remaining <= 50);
+    });
+  }
+</script>
+
+<script id=did-timeout-when-never-idle type=module>
+  {
+    const state = await testing.async();
+
+    // Kept busy past the timeout, the callback runs because of it.
+    let didTimeout = null;
+    let remaining = null;
+    window.requestIdleCallback((deadline) => {
+      didTimeout = deadline.didTimeout;
+      remaining = deadline.timeRemaining();
+      state.resolve();
+    }, { timeout: 10 });
+    const until = performance.now() + 30;
+    while (performance.now() < until) {}
+
+    await state.done(() => {
+      testing.expectEqual(true, didTimeout);
+      testing.expectEqual(0, remaining);
+    });
+  }
+</script>
+
+<script id=cancel type=module>
+  {
+    const state = await testing.async();
+
+    let ran = 0;
+    const idle = window.requestIdleCallback(() => { ran += 1; });
+    window.cancelIdleCallback(idle);
+    const timed = window.requestIdleCallback(() => { ran += 1; }, { timeout: 5 });
+    window.cancelIdleCallback(timed);
+
+    window.setTimeout(() => state.resolve(), 100);
+
+    await state.done(() => testing.expectEqual(0, ran));
+  }
+</script>
+
+<script id=order-and-next-period type=module>
+  {
+    const state = await testing.async();
+
+    // Callbacks run in the order requested; one requested from an idle
+    // callback waits for the next idle period.
+    const order = [];
+    window.requestIdleCallback(() => {
+      order.push(1);
+      window.requestIdleCallback(() => {
+        order.push(3);
+        state.resolve();
+      });
+    });
+    window.requestIdleCallback(() => order.push(2));
+
+    await state.done(() => testing.expectEqual('1,2,3', order.join(',')));
+  }
+</script>
+
+<script id=timeout-zero-means-none type=module>
+  {
+    const state = await testing.async();
+
+    let didTimeout = null;
+    window.requestIdleCallback((deadline) => {
+      didTimeout = deadline.didTimeout;
+      state.resolve();
+    }, { timeout: 0 });
+
+    await state.done(() => testing.expectEqual(false, didTimeout));
+  }
+</script>
