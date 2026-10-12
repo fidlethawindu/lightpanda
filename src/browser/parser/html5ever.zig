@@ -257,6 +257,18 @@ pub extern "c" fn encoding_for_label(
     label_len: usize,
 ) EncodingInfo;
 
+pub extern "c" fn encoding_for_bom(
+    data: [*]const u8,
+    data_len: usize,
+) EncodingInfo;
+
+pub extern "c" fn encoding_detect(
+    data: [*]const u8,
+    data_len: usize,
+    tld: ?[*]const u8,
+    tld_len: usize,
+) EncodingInfo;
+
 pub extern "c" fn encoding_max_utf8_buffer_length(
     handle: *anyopaque,
     input_len: usize,

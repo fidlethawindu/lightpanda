@@ -1769,6 +1769,19 @@ fn urlBasename(arena: Allocator, url: []const u8) !?[]const u8 {
     return try arena.dupe(u8, name);
 }
 
+// Guesses the encoding of a document that declares none. The detector weighs
+// the rightmost label of the host (e.g. "jp" favours Japanese encodings); it's
+// passed only when it is lower-case ASCII, as the detector requires.
+fn detectCharset(url: []const u8, html: []const u8) []const u8 {
+    const host = URL.getHostname(url);
+    const label = if (std.mem.lastIndexOfScalar(u8, host, '.')) |dot| host[dot + 1 ..] else host;
+    const usable = label.len > 0 and for (label) |byte| {
+        if (!(std.ascii.isLower(byte) or std.ascii.isDigit(byte) or byte == '-')) break false;
+    } else true;
+    const info = h5e.encoding_detect(html.ptr, html.len, if (usable) label.ptr else null, if (usable) label.len else 0);
+    return info.name();
+}
+
 fn isUtf16Encoding(charset: []const u8) bool {
     return std.mem.eql(u8, charset, "UTF-16LE") or std.mem.eql(u8, charset, "UTF-16BE");
 }
@@ -1832,13 +1845,16 @@ fn frameDataCallback(transfer: *HttpClient.Transfer, data: []const u8) !void {
                 // Normalize and store the charset using encoding_rs canonical names
                 const charset_str = mime.charsetString();
                 const info = h5e.encoding_for_label(charset_str.ptr, charset_str.len);
+                var charset_declared = false;
                 if (info.isValid()) {
                     const name = info.name();
                     self.charset = if (html_prescan_found_charset and isUtf16Encoding(name)) "UTF-8" else name;
+                    charset_declared = html_prescan_found_charset or mime.is_default_charset == false;
                 }
                 self._parse_state = .{ .html = .{
                     .buffer = .empty,
                     .arena = try self.getArena(.large, "Frame.navigate"),
+                    .charset_declared = charset_declared,
                 } };
             },
             .application_json, .text_javascript, .text_css, .text_plain, .text_markdown => {
@@ -1931,9 +1947,21 @@ fn frameDoneCallback(ctx: *anyopaque) !void {
 
                 const raw_html = html.buffer.items;
 
+                // The HTML encoding sniffing algorithm: a BOM wins over every
+                // declaration; with neither a BOM nor a declaration, the
+                // encoding is detected from the content.
+                const bom = h5e.encoding_for_bom(raw_html.ptr, raw_html.len);
+                if (bom.isValid()) {
+                    self.charset = bom.name();
+                } else if (html.charset_declared == false) {
+                    self.charset = detectCharset(self.url, raw_html);
+                }
+
                 preload.prescan(self, raw_html);
 
-                if (std.mem.eql(u8, self.charset, "UTF-8")) {
+                // Decoding (rather than parsing the bytes as UTF-8) also
+                // removes the BOM.
+                if (std.mem.eql(u8, self.charset, "UTF-8") and bom.isValid() == false) {
                     parser.parse(raw_html);
                 } else {
                     parser.parseWithEncoding(raw_html, self.charset);
@@ -3557,6 +3585,10 @@ const ParseState = union(enum) {
     html: struct {
         arena: *lp.Arena,
         buffer: std.ArrayList(u8),
+        // The Content-Type header or a <meta> declaration named a supported
+        // encoding. Without one, the encoding is detected once the whole
+        // document has arrived.
+        charset_declared: bool,
     },
     text: std.ArrayList(u8),
     image: std.ArrayList(u8),
@@ -4513,4 +4545,75 @@ test "Frame: iframeAddedCallback does not create a frame when termination is pen
     try frame.iframeAddedCallback(iframe);
     try testing.expectEqual(contexts_before, env.contexts.items.len);
     try testing.expectEqual(false, iframe._executed);
+}
+
+// Navigates a new page to a data: URL of exactly `bytes` and waits for it to load.
+fn navigateToBytes(comptime media_type: []const u8, bytes: []const u8) !Session.PageHandle {
+    const page = try testing.test_session.createPage();
+    errdefer page.close();
+    var url: std.ArrayList(u8) = .empty;
+    try url.appendSlice(testing.arena_allocator, "data:" ++ media_type ++ ",");
+    for (bytes) |byte| try url.print(testing.arena_allocator, "%{X:0>2}", .{byte});
+    try url.append(testing.arena_allocator, 0);
+    try page.navigate(url.items[0 .. url.items.len - 1 :0], .{});
+    var runner = testing.test_session.runner(.{});
+    try runner.waitForFrame(page.frame_id, 2000, .{ .until = .done });
+    return page;
+}
+
+// The text of the first <p> in the frame's document.
+fn firstParagraph(frame: *Frame) ![]const u8 {
+    var buf = std.Io.Writer.Allocating.init(testing.arena_allocator);
+    try @import("dump.zig").root(frame.document, .{}, &buf.writer, frame);
+    const html = buf.written();
+    const start = (std.mem.indexOf(u8, html, "<p>") orelse return error.NoParagraph) + "<p>".len;
+    const end = std.mem.indexOfPos(u8, html, start, "</p>") orelse return error.NoParagraph;
+    return html[start..end];
+}
+
+test "Frame: a UTF-16 byte order mark decides the encoding of an undeclared document" {
+    var page = try navigateToBytes("text/html", "\xff\xfe\x3c\x00\x70\x00\x3e\x00\xa9\x03\x6d\x00\x65\x00\x67\x00\x61\x00\x3c\x00\x2f\x00\x70\x00\x3e\x00");
+    defer page.close();
+    const frame = page.frame().?;
+    try testing.expectEqual("UTF-16LE", frame.charset);
+    try testing.expectEqual("Ωmega", try firstParagraph(frame));
+}
+
+test "Frame: a byte order mark wins over the Content-Type charset" {
+    var page = try navigateToBytes("text/html;charset=windows-1252", "\xef\xbb\xbf<p>\xce\xa9mega</p>");
+    defer page.close();
+    const frame = page.frame().?;
+    try testing.expectEqual("UTF-8", frame.charset);
+    try testing.expectEqual("Ωmega", try firstParagraph(frame));
+}
+
+test "Frame: the encoding of an undeclared document is detected from its content" {
+    {
+        var page = try navigateToBytes("text/html", "<p>" ++ "\x4e\x6f\x74\x72\x65\x20\x63\x61\x66\xe9\x20\x70\x72\x6f\x70\x6f\x73\x65\x20\x64\x65\x73\x20\x63\x72\xea\x70\x65\x73\x2c\x20\x64\x65\x73\x20\x70\xe2\x74\x69\x73\x73\x65\x72\x69\x65\x73\x20\x65\x74\x20\x75\x6e\x20\x74\x68\xe9\x20\x67\x6c\x61\x63\xe9\x20\x70\x72\xe9\x70\x61\x72\xe9\x20\xe0\x20\x6c\x61\x20\x66\x72\x61\x6e\xe7\x61\x69\x73\x65\x2e\x20\x52\xe9\x73\x65\x72\x76\x65\x7a\x20\x64\xe8\x73\x20\x61\x75\x6a\x6f\x75\x72\x64\x92\x68\x75\x69\x20\x21" ++ "</p>");
+        defer page.close();
+        const frame = page.frame().?;
+        try testing.expectEqual("windows-1252", frame.charset);
+        try testing.expectEqual("Notre café propose des crêpes, des pâtisseries et un thé glacé préparé à la française. Réservez dès aujourd’hui !", try firstParagraph(frame));
+    }
+    {
+        var page = try navigateToBytes("text/html", "<p>" ++ "\x93\x8c\x8b\x9e\x93\x73\x8f\x61\x92\x4a\x8b\xe6\x82\xcc\x8f\xac\x82\xb3\x82\xc8\x89\xd4\x89\xae\x82\xc5\x82\xb7\x81\x42\x8b\x47\x90\xdf\x82\xcc\x89\xd4\x91\xa9\x82\xc6\x83\x41\x83\x8c\x83\x93\x83\x57\x83\x81\x83\x93\x83\x67\x82\xf0\x82\xb2\x97\x70\x88\xd3\x82\xb5\x82\xc4\x82\xa8\x82\xe8\x82\xdc\x82\xb7\x81\x42" ++ "</p>");
+        defer page.close();
+        const frame = page.frame().?;
+        try testing.expectEqual("Shift_JIS", frame.charset);
+        try testing.expectEqual("東京都渋谷区の小さな花屋です。季節の花束とアレンジメントをご用意しております。", try firstParagraph(frame));
+    }
+    {
+        var page = try navigateToBytes("text/html", "<p>Caf\xc3\xa9 cr\xc3\xa8me br\xc3\xbbl\xc3\xa9e \xe2\x80\x94 d\xc3\xa8s aujourd\xe2\x80\x99hui</p>");
+        defer page.close();
+        const frame = page.frame().?;
+        try testing.expectEqual("UTF-8", frame.charset);
+        try testing.expectEqual("Café crème brûlée — dès aujourd’hui", try firstParagraph(frame));
+    }
+}
+
+test "Frame: a declared encoding is not second-guessed by detection" {
+    // Shift_JIS bytes under a windows-1252 declaration decode as windows-1252.
+    var page = try navigateToBytes("text/html", "<meta charset=windows-1252><p>" ++ "\x93\x8c\x8b\x9e\x93\x73\x8f\x61\x92\x4a\x8b\xe6\x82\xcc\x8f\xac\x82\xb3\x82\xc8\x89\xd4\x89\xae\x82\xc5\x82\xb7\x81\x42\x8b\x47\x90\xdf\x82\xcc\x89\xd4\x91\xa9\x82\xc6\x83\x41\x83\x8c\x83\x93\x83\x57\x83\x81\x83\x93\x83\x67\x82\xf0\x82\xb2\x97\x70\x88\xd3\x82\xb5\x82\xc4\x82\xa8\x82\xe8\x82\xdc\x82\xb7\x81\x42" ++ "</p>");
+    defer page.close();
+    try testing.expectEqual("windows-1252", page.frame().?.charset);
 }

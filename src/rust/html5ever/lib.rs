@@ -205,6 +205,81 @@ pub extern "C" fn encoding_for_label(label: *const c_uchar, label_len: usize) ->
     }
 }
 
+fn encoding_info(encoding: &'static Encoding) -> EncodingInfo {
+    let name = encoding.name();
+    EncodingInfo {
+        found: 1,
+        name_len: name.len(),
+        name_ptr: name.as_ptr(),
+        handle: encoding as *const _ as *const c_void,
+    }
+}
+
+fn encoding_not_found() -> EncodingInfo {
+    EncodingInfo {
+        found: 0,
+        name_len: 0,
+        name_ptr: std::ptr::null(),
+        handle: std::ptr::null(),
+    }
+}
+
+/// The encoding a byte order mark at the start of `data` declares (UTF-8,
+/// UTF-16LE or UTF-16BE), if there is one. In the HTML encoding sniffing
+/// algorithm a BOM takes precedence over every declared label.
+#[no_mangle]
+pub extern "C" fn encoding_for_bom(data: *const c_uchar, data_len: usize) -> EncodingInfo {
+    if data.is_null() || data_len == 0 {
+        return encoding_not_found();
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(data, data_len) };
+    match Encoding::for_bom(bytes) {
+        Some((encoding, _)) => encoding_info(encoding),
+        None => encoding_not_found(),
+    }
+}
+
+/// Guesses the encoding of a document that declares none (no BOM, no
+/// Content-Type charset, no <meta> declaration), the step the HTML encoding
+/// sniffing algorithm leaves to frequency analysis. `tld` is the rightmost
+/// label of the document's host, lower-case ASCII, or null.
+///
+/// UTF-8 is allowed as a result, as Chrome's detector allows it; chardetng
+/// recommends against that for browsers so pages keep labelling themselves,
+/// but an unlabelled UTF-8 page is far more common than a legacy one and would
+/// otherwise always be decoded wrong. ISO-2022-JP is not, as chardetng advises
+/// for documents that can run scripts.
+#[no_mangle]
+pub extern "C" fn encoding_detect(
+    data: *const c_uchar,
+    data_len: usize,
+    tld: *const c_uchar,
+    tld_len: usize,
+) -> EncodingInfo {
+    let bytes: &[u8] = if data.is_null() || data_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(data, data_len) }
+    };
+    // chardetng panics on a label that isn't lower-case ASCII without periods.
+    let tld: Option<&[u8]> = if tld.is_null() || tld_len == 0 {
+        None
+    } else {
+        let label = unsafe { std::slice::from_raw_parts(tld, tld_len) };
+        if label
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+        {
+            Some(label)
+        } else {
+            None
+        }
+    };
+    let mut detector = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Deny);
+    detector.feed(bytes, true);
+    encoding_info(detector.guess(tld, chardetng::Utf8Detection::Allow))
+}
+
 /// Calculate maximum UTF-8 buffer size needed for decoding
 #[no_mangle]
 pub extern "C" fn encoding_max_utf8_buffer_length(
