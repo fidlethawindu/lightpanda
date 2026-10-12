@@ -1184,18 +1184,26 @@ fn getLayoutMetrics(cmd: *CDP.Command) !void {
         break :blk @max(height, h);
     };
 
+    // Where the main frame's viewport is scrolled to; a context with no page
+    // has nothing scrolled.
+    const scroll: struct { x: u32, y: u32 } = blk: {
+        const bc = cmd.browser_context orelse break :blk .{ .x = 0, .y = 0 };
+        const frame = bc.mainFrame() orelse break :blk .{ .x = 0, .y = 0 };
+        break :blk .{ .x = frame.window.getScrollX(), .y = frame.window.getScrollY() };
+    };
+
     return cmd.sendResult(.{
         .layoutViewport = .{
-            .pageX = 0,
-            .pageY = 0,
+            .pageX = scroll.x,
+            .pageY = scroll.y,
             .clientWidth = width,
             .clientHeight = height,
         },
         .visualViewport = .{
             .offsetX = 0,
             .offsetY = 0,
-            .pageX = 0,
-            .pageY = 0,
+            .pageX = scroll.x,
+            .pageY = scroll.y,
             .clientWidth = width,
             .clientHeight = height,
             .scale = 1,
@@ -1208,16 +1216,16 @@ fn getLayoutMetrics(cmd: *CDP.Command) !void {
             .height = content_height,
         },
         .cssLayoutViewport = .{
-            .pageX = 0,
-            .pageY = 0,
+            .pageX = scroll.x,
+            .pageY = scroll.y,
             .clientWidth = width,
             .clientHeight = height,
         },
         .cssVisualViewport = .{
             .offsetX = 0,
             .offsetY = 0,
-            .pageX = 0,
-            .pageY = 0,
+            .pageX = scroll.x,
+            .pageY = scroll.y,
             .clientWidth = width,
             .clientHeight = height,
             .scale = 1,
@@ -2089,6 +2097,33 @@ test "cdp.frame: getLayoutMetrics" {
             .height = height,
         },
     }, .{ .id = 12 });
+}
+
+test "cdp.frame: getLayoutMetrics reports the scroll position" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{});
+    const page = try bc.session.createPage();
+    const frame = page.frame().?;
+    try frame.navigate("http://localhost:9582/src/browser/tests/tall_page.html", .{ .reason = .address_bar, .kind = .{ .push = null } });
+    try testing.waitForPage(bc);
+
+    {
+        var ls: lp.js.Local.Scope = undefined;
+        frame.js.localScope(&ls);
+        defer ls.deinit();
+        _ = try ls.local.compileAndRun("window.scrollTo(15, 300)", null);
+    }
+
+    const scrolled = .{ .pageX = 15, .pageY = 300 };
+    try ctx.processMessage(.{ .id = 13, .method = "Page.getLayoutMetrics" });
+    try ctx.expectSentResult(.{
+        .layoutViewport = scrolled,
+        .visualViewport = scrolled,
+        .cssLayoutViewport = scrolled,
+        .cssVisualViewport = scrolled,
+    }, .{ .id = 13 });
 }
 
 test "cdp.frame: reload" {
