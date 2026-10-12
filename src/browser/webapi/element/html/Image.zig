@@ -156,6 +156,13 @@ fn imageAddedCallback(self: *Image, frame: *Frame) !void {
     };
 }
 
+/// The element was adopted into another document: a relevant mutation, which
+/// restarts the load whatever the selection, since the new document decides
+/// whether anything is fetched at all.
+pub fn adopted(self: *Image, frame: *Frame) !void {
+    return self.imageAddedCallback(frame);
+}
+
 /// An insertion or <picture> mutation: only restart the load if it changed the
 /// selection. A parser-created image has selected nothing until its insertion.
 pub fn sourceChanged(self: *Image, frame: *Frame) !void {

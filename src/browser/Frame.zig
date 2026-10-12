@@ -2857,6 +2857,13 @@ pub fn adoptNodeTree(self: *Frame, node: *Node, old_owner: *Document, new_owner:
     if (node.is(Element)) |el| {
         el._attributes.adopt(node._owner, self);
         Element.Html.Custom.enqueueAdoptedCallbackOnElement(el, old_owner, new_owner, self);
+        // Adoption is one of an image's relevant mutations: one parsed in a
+        // document without a browsing context starts loading once adopted
+        // into one that has it.
+        // A document without a frame loads nothing, which adopted() checks.
+        if (el.is(Element.Html.Image)) |img| {
+            try img.adopted(new_owner._frame orelse self);
+        }
 
         // The shadow tree follows its host across documents: re-own it and
         // run its adopted reactions too (spec: shadow-including descendants).

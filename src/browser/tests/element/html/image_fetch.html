@@ -333,3 +333,29 @@
     testing.expectEqual("error", from_source);
   });
 </script>
+
+<script id="img-adopted-inside-a-subtree-loads" type=module>
+  // Built in a document without a browsing context (as DOMParser and
+  // jQuery.parseHTML do), nothing is fetched; adopting the image, here as a
+  // descendant of the inserted node, starts its load.
+  const state = await testing.async();
+  const parsed = new DOMParser().parseFromString('<div><p><img src="/images/ok.png"></p></div>', 'text/html');
+  const img = parsed.querySelector('img');
+  testing.expectEqual(true, img.complete);
+  testing.expectEqual(0, img.naturalWidth);
+
+  const evt = new Promise(resolve => {
+    img.addEventListener("load", () => resolve("load"));
+    img.addEventListener("error", () => resolve("error"));
+  });
+  document.body.appendChild(parsed.querySelector('div'));
+  const inFlight = img.complete;
+
+  const result = await evt;
+  state.resolve();
+  await state.done(() => {
+    testing.expectEqual(false, inFlight);
+    testing.expectEqual("load", result);
+    testing.expectEqual(1000, img.naturalWidth);
+  });
+</script>
