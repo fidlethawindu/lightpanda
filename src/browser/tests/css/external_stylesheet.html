@@ -68,6 +68,51 @@
     });
   </script>
 
+  <script id="ext_stylesheet_listeners_after_append" type=module>
+    // load/error are dispatched from a task after the fetch, never inside
+    // appendChild: a script that attaches its listeners on the line after
+    // inserting the link must still hear them.
+    const state = await testing.async();
+    const settle = (href) => new Promise(resolve => {
+      const link = document.createElement('link');
+      link.rel = 'stylesheet';
+      link.href = href;
+      document.head.appendChild(link);
+      link.addEventListener('load', () => resolve('load'));
+      link.addEventListener('error', () => resolve('error'));
+    });
+
+    const loaded = await settle('/styles/visibility.css');
+    const failed = await settle('/styles/404.css');
+
+    state.resolve();
+    await state.done(() => {
+      testing.expectEqual('load', loaded);
+      testing.expectEqual('error', failed);
+    });
+  </script>
+
+  <script id="ext_stylesheet_appended_twice" type=module>
+    // The same link appended twice in a row, listeners attached after, as
+    // some widget loaders do: load still reaches the listener.
+    const state = await testing.async();
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = '/styles/visibility2.css';
+    document.head.appendChild(link);
+    document.head.appendChild(link);
+
+    const evt = await new Promise(resolve => {
+      link.addEventListener('load', () => resolve('load'), { once: true });
+      link.addEventListener('error', () => resolve('error'), { once: true });
+    });
+
+    state.resolve();
+    await state.done(() => {
+      testing.expectEqual('load', evt);
+    });
+  </script>
+
   <script id="ext_stylesheet_large_applies" type=module>
     const state = await testing.async();
     const el = document.createElement('div');
